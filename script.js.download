@@ -1,0 +1,373 @@
+// DOM Cache
+const dom = {
+  connectionError: document.getElementById('connection-error'),
+  loader: document.getElementById('loader'),
+  gameDashboard: document.getElementById('game-dashboard'),
+  wordSlotsWrapper: document.getElementById('word-slots-wrapper'),
+  heartsContainer: document.getElementById('hearts-container'),
+  guessedLettersList: document.getElementById('guessed-letters-list'),
+  feedbackAlert: document.getElementById('feedback-alert'),
+  keyboardGrid: document.getElementById('keyboard-grid'),
+  gameOverOverlay: document.getElementById('game-over-overlay'),
+  modalBadge: document.getElementById('modal-badge'),
+  modalTitle: document.getElementById('modal-title'),
+  modalText: document.getElementById('modal-text'),
+  modalReveal: document.getElementById('modal-reveal'),
+  
+  // Stats
+  statTotal: document.getElementById('stat-total'),
+  statRate: document.getElementById('stat-rate'),
+  statSplitW: document.getElementById('stat-split-w'),
+  statSplitL: document.getElementById('stat-split-l'),
+  statStreak: document.getElementById('stat-streak'),
+  historyLogList: document.getElementById('history-log-list'),
+
+  // Stick figure parts
+  parts: {
+    1: document.getElementById('part-head'),
+    2: document.getElementById('part-body'),
+    3: document.getElementById('part-larm'),
+    4: document.getElementById('part-rarm'),
+    5: document.getElementById('part-lleg'),
+    6: document.getElementById('part-rleg')
+  }
+};
+
+// Alphabet list for virtual keyboard keys
+const ALPHABET = 'abcdefghijklmnopqrstuvwxyz'.split('');
+
+// Keep track of the local history array (redundant client-side persistence)
+let clientHistory = [];
+
+/**
+ * Bootstraps the application on document load.
+ */
+document.addEventListener('DOMContentLoaded', () => {
+  // Initialize virtual keys
+  buildVirtualKeyboard();
+
+  // Load local history cache
+  const cachedHistory = localStorage.getItem('hangman_web_session_history');
+  if (cachedHistory) {
+    try {
+      clientHistory = JSON.parse(cachedHistory);
+    } catch (e) {
+      console.error("Failed to parse cached history log:", e);
+    }
+  }
+
+  // Fetch initial state
+  fetchState();
+});
+
+/**
+ * Creates the A-Z buttons inside the keyboard grid.
+ */
+function buildVirtualKeyboard() {
+  dom.keyboardGrid.innerHTML = '';
+  ALPHABET.forEach(letter => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = letter.toUpperCase();
+    btn.className = 'key-button';
+    btn.setAttribute('data-key', letter);
+    btn.addEventListener('click', () => handleGuess(letter));
+    dom.keyboardGrid.appendChild(btn);
+  });
+}
+
+/**
+ * Fetches the current game state from the Flask backend.
+ */
+async function fetchState() {
+  showLoader(true);
+  hideError();
+  try {
+    const response = await fetch('/game-state');
+    if (!response.ok) throw new Error('API unreachable');
+    const state = await response.json();
+    syncUI(state);
+    showLoader(false);
+  } catch (err) {
+    showLoader(false);
+    showError();
+  }
+}
+
+/**
+ * Starts a new game session on the server.
+ */
+async function startNewGame() {
+  showLoader(true);
+  hideError();
+  // Close any overlay
+  dom.gameOverOverlay.style.display = 'none';
+  try {
+    const response = await fetch('/new-game', { method: 'POST' });
+    if (!response.ok) throw new Error('API unreachable');
+    const state = await response.json();
+    syncUI(state);
+    
+    // Clear keyboard visual markers
+    document.querySelectorAll('.key-button').forEach(btn => {
+      btn.className = 'key-button';
+      btn.disabled = false;
+    });
+
+    setFeedback('New game started! Guess a letter to begin.', true);
+    showLoader(false);
+  } catch (err) {
+    showLoader(false);
+    showError();
+  }
+}
+
+/**
+ * Submits a single letter guess to the Flask server.
+ */
+async function handleGuess(letter) {
+  // Find key button and disable it immediately
+  const btn = document.querySelector(`.key-button[data-key="${letter}"]`);
+  if (btn) btn.disabled = true;
+
+  try {
+    const response = await fetch('/guess', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ letter })
+    });
+    
+    const result = await response.json();
+    
+    // Update button colors based on correctness
+    if (btn) {
+      if (result.success && result.message.includes('Nice guess')) {
+        btn.classList.add('correct');
+      } else {
+        btn.classList.add('incorrect');
+      }
+    }
+
+    if (result.game_state) {
+      syncUI(result.game_state);
+    }
+    
+    setFeedback(result.message, result.success);
+
+  } catch (err) {
+    setFeedback('Network connection error. Is the Flask server online?', false);
+  }
+}
+
+/**
+ * Synchronizes the DOM using the retrieved state dictionary.
+ */
+function syncUI(state) {
+  // 1. Render Word display slots
+  dom.wordSlotsWrapper.innerHTML = '';
+  const displayLetters = state.word_display ? state.word_display.split(' ') : [];
+  
+  displayLetters.forEach((char, index) => {
+    const slot = document.createElement('div');
+    slot.className = 'letter-slot';
+    
+    const isRevealed = char !== '_';
+    
+    if (state.status === 'lost' && !isRevealed && state.word) {
+      slot.textContent = state.word[index];
+      slot.classList.add('revealed-lost');
+    } else if (isRevealed) {
+      slot.textContent = char;
+      slot.classList.add('revealed');
+    }
+    
+    dom.wordSlotsWrapper.appendChild(slot);
+  });
+
+  // 2. Render Attempts Hearts List
+  dom.heartsContainer.innerHTML = '';
+  for (let i = 0; i < 6; i++) {
+    const heart = document.createElement('span');
+    heart.className = `heart-icon ${i >= state.remaining_attempts ? 'lost' : ''}`;
+    heart.textContent = '❤️';
+    dom.heartsContainer.appendChild(heart);
+  }
+
+  // 3. Render Guessed letters capsules
+  dom.guessedLettersList.innerHTML = '';
+  if (state.guessed_letters && state.guessed_letters.length > 0) {
+    state.guessed_letters.forEach(letter => {
+      const pill = document.createElement('span');
+      // If we know the word (won/lost) or if it's correct guess
+      const isHit = state.word ? state.word.includes(letter) : displayLetters.includes(letter);
+      pill.className = `guessed-char-pill ${isHit ? 'hit' : 'miss'}`;
+      pill.textContent = letter;
+      dom.guessedLettersList.appendChild(pill);
+    });
+  } else {
+    const mutedSpan = document.createElement('span');
+    mutedSpan.style.color = 'var(--text-muted)';
+    mutedSpan.style.fontSize = '0.85rem';
+    mutedSpan.textContent = 'No guesses yet';
+    dom.guessedLettersList.appendChild(mutedSpan);
+  }
+
+  // 4. Update Hangman SVG segments
+  const mistakes = 6 - state.remaining_attempts;
+  for (let i = 1; i <= 6; i++) {
+    const element = dom.parts[i];
+    if (element) {
+      element.style.display = i <= mistakes ? 'block' : 'none';
+    }
+  }
+
+  // 5. Update keyboard state on page sync (if resuming active game)
+  if (state.status === 'playing') {
+    document.querySelectorAll('.key-button').forEach(btn => {
+      const letter = btn.getAttribute('data-key');
+      const hasGuessed = state.guessed_letters.includes(letter);
+      btn.disabled = hasGuessed;
+      if (hasGuessed) {
+        const isHit = state.word_display.includes(letter);
+        btn.classList.add(isHit ? 'correct' : 'incorrect');
+      }
+    });
+  }
+
+  // 6. Handle Game Over modal trigger
+  if (state.status !== 'playing') {
+    // Disable keyboard
+    document.querySelectorAll('.key-button').forEach(btn => btn.disabled = true);
+    
+    // Update modal properties
+    dom.modalReveal.textContent = state.word;
+    dom.modalBadge.className = `status-badge ${state.status === 'won' ? 'won' : 'lost'}`;
+    dom.modalBadge.textContent = state.status === 'won' ? 'Mission Success' : 'Neural Disconnect';
+    
+    dom.modalTitle.className = `modal-title ${state.status === 'won' ? 'won' : 'lost'}`;
+    dom.modalTitle.textContent = state.status === 'won' ? 'Victory!' : 'Game Over';
+    
+    dom.modalText.textContent = state.status === 'won' 
+      ? 'Phenomenal job! You successfully decoded the neural link.'
+      : 'The signal was lost. The original codeword was:';
+      
+    dom.gameOverOverlay.style.display = 'flex';
+  }
+
+  // 7. Update Session statistics logs
+  // Prioritize server logs list, fallback to clientHistory cache
+  const activeHistory = (state.history && state.history.length > 0) ? state.history : clientHistory;
+  
+  // Save cache
+  if (state.history && state.history.length > 0) {
+    clientHistory = state.history;
+    localStorage.setItem('hangman_web_session_history', JSON.stringify(state.history));
+  }
+
+  updateStatsPanel(activeHistory);
+}
+
+/**
+ * Computes stats cards and renders timeline logs.
+ */
+function updateStatsPanel(history) {
+  const total = history.length;
+  const wins = history.filter(g => g.status === 'won').length;
+  const losses = history.filter(g => g.status === 'lost').length;
+  const rate = total > 0 ? Math.round((wins / total) * 100) : 0;
+  
+  // Win streak
+  let streak = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].status === 'won') {
+      streak++;
+    } else {
+      break;
+    }
+  }
+
+  dom.statTotal.textContent = total;
+  dom.statRate.textContent = `${rate}%`;
+  dom.statSplitW.textContent = `${wins} W`;
+  dom.statSplitL.textContent = `${losses} L`;
+  dom.statStreak.textContent = streak;
+
+  // Timeline list log rendering (descending order)
+  dom.historyLogList.innerHTML = '';
+  if (total === 0) {
+    dom.historyLogList.innerHTML = `
+      <div class="empty-history-message">
+        No completed session files logged. Finish a game to write to neural logs.
+      </div>
+    `;
+    return;
+  }
+
+  const reversedHistory = [...history].reverse();
+  reversedHistory.forEach(game => {
+    const isWon = game.status === 'won';
+    
+    const item = document.createElement('div');
+    item.className = `history-log-item ${isWon ? 'won-border' : 'lost-border'}`;
+
+    // Render inner content safely
+    item.innerHTML = `
+      <div class="log-item-header">
+        <span class="log-game-num">Log #${game.game_number}</span>
+        <span class="log-badge ${isWon ? 'won' : 'lost'}">${isWon ? 'SUCCESS' : 'FAILED'}</span>
+      </div>
+      <div class="log-item-body">
+        <div class="log-word-info">
+          <span class="log-detail-lbl">Decoded Word:</span>
+          <span class="log-word-val ${isWon ? 'won' : 'lost'}">${game.word.toUpperCase()}</span>
+        </div>
+        <div class="log-stats-info">
+          <span>Attempts Left: <strong>${game.remaining_attempts}/6</strong></span>
+        </div>
+      </div>
+      <div class="log-guesses-row">
+        <span class="log-detail-lbl">Guessed Letters:</span>
+        <div class="log-letters-list"></div>
+      </div>
+    `;
+
+    // Append characters capsules dynamically
+    const list = item.querySelector('.log-letters-list');
+    if (game.guessed_letters && game.guessed_letters.length > 0) {
+      game.guessed_letters.forEach(char => {
+        const span = document.createElement('span');
+        const isHit = game.word.includes(char);
+        span.className = `log-char-pill ${isHit ? 'hit' : 'miss'}`;
+        span.textContent = char.toUpperCase();
+        list.appendChild(span);
+      });
+    } else {
+      list.innerHTML = '<span class="log-muted-text">None</span>';
+    }
+
+    dom.historyLogList.appendChild(item);
+  });
+}
+
+/**
+ * Sets the notification feedback text inside the alert panel.
+ */
+function setFeedback(msg, success) {
+  dom.feedbackAlert.textContent = msg;
+  dom.feedbackAlert.className = `alert-box ${success ? 'success' : 'error'}`;
+}
+
+// Helpers
+function showLoader(visible) {
+  dom.loader.style.display = visible ? 'flex' : 'none';
+  dom.gameDashboard.style.display = visible ? 'none' : 'grid';
+}
+
+function showError() {
+  dom.connectionError.style.display = 'block';
+  dom.gameDashboard.style.display = 'none';
+}
+
+function hideError() {
+  dom.connectionError.style.display = 'none';
+}
